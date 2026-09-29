@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>microduck 從 MuJoCo 到 PPO：實驗 2–9 講義</title>
+<style>
+:root{--bg:#fafaf7;--fg:#1d1d1b;--mut:#666;--card:#fff;--line:#ddd9cf;--acc:#b4530f;--code:#f1eee6}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#171716;--fg:#e8e6df;--mut:#9a978d;--card:#211f1d;--line:#3a3733;--acc:#f0a35e;--code:#2a2724}}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.75 "Noto Sans TC",system-ui,sans-serif}
+.wrap{max-width:860px;margin:0 auto;padding:24px 18px 80px}
+h1{font-size:1.9rem;margin:.2em 0}h2{margin-top:2.4em;border-bottom:2px solid var(--acc);padding-bottom:.2em}
+h3{margin-top:1.4em;color:var(--acc)}
+nav{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 16px}
+nav a{color:var(--acc);text-decoration:none;margin-right:12px;white-space:nowrap}
+.goal{background:var(--card);border-left:4px solid var(--acc);padding:8px 14px;border-radius:6px}
+code,pre{background:var(--code);border-radius:5px;font:13.5px/1.6 ui-monospace,Menlo,monospace}
+code{padding:1px 5px}pre{padding:10px 14px;overflow-x:auto}
+.tw{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:.93rem}
+th,td{border:1px solid var(--line);padding:6px 10px;text-align:left}th{background:var(--code)}
+.note{color:var(--mut);font-size:.92rem}
+</style>
+</head>
+<body><div class="wrap">
+<p class="note">CYCU 電機系 · 機器人強化學習實作講義</p>
+<h1>microduck：從 MuJoCo 物理模擬到 PPO 策略</h1>
+<p class="note">已納入實驗 6–9 的實測 summary（單一訓練 seed）。依據 experiment2–9 程式與 microduck_rl／microduck 原始碼分析整理。原始碼分析部分未實際執行 GPU 訓練或實機測試。</p>
+<nav><a href="#intro">導論</a><a href="#e2">實驗2</a><a href="#e3">實驗3</a><a href="#e4">實驗4</a><a href="#e5">實驗5</a><a href="#e6">實驗6</a><a href="#e7">實驗7</a><a href="#e8">實驗8</a><a href="#e9">實驗9</a><a href="#sum">總結</a></nav>
+
+<h2 id="intro">導論</h2>
+<h3>0.1 一句話總結整個專案</h3>
+<p>在 GPU 上以物理模擬與 PPO 訓練單一策略網路，匯出成 ONNX，在機器人的 RK3566 上每 20 ms 推論一次，輸出各關節的目標角度，再由伺服韌體追蹤。能從模擬走到實機，靠的不只是 PPO，還有馬達模型（BAM）、感測誤差與延遲、reward 設計，以及訓練端與部署端一致的控制介面。</p>
+
+<h3>0.2 誰負責什麼</h3>
+<div class="tw"><table>
+<tr><th>元件</th><th>位置</th><th>工作</th></tr>
+<tr><td>microduck_rl</td><td>訓練電腦</td><td>任務、reward、PPO 訓練</td></tr>
+<tr><td>MuJoCo / MuJoCo Warp</td><td>CPU / GPU</td><td>剛體、關節、接觸的物理計算</td></tr>
+<tr><td>BAM</td><td>模擬環境</td><td>XL330 伺服馬達的電壓、反電動勢、摩擦模型</td></tr>
+<tr><td>rsl_rl</td><td>訓練電腦</td><td>更新 Actor / Critic</td></tr>
+<tr><td>ONNX</td><td>電腦或機器人</td><td>保存策略推論圖（含 observation normalization）</td></tr>
+<tr><td>robotd (Rust)</td><td>RK3566</td><td>讀感測器、組 observation、推論、寫馬達</td></tr>
+</table></div>
+<p>這是 <b>model-free PPO</b>：有物理模擬器，但不訓練神經網路動態模型。「有模擬器」不等於 model-based RL。</p>
+
+<h3>0.3 策略學的是什麼：單一網路，狀態 → 動作</h3>
+<p>整隻鴨不是「先定關鍵部位再依序給其他部位」，也不是「每個關節一個策略」。標準做法是<b>一個網路每個控制時刻同時輸出所有關節目標</b>，走路的週期性是 reward 逼出的湧現行為。腿式機器人關節高度耦合（髖怎麼動取決於膝、踝與重心），所以獨立策略通常行不通。</p>
+<div class="tw"><table>
+<tr><th></th><th>microduck 主要步行</th><th>本講義的單關節縮影（實驗5–9）</th></tr>
+<tr><td>Observation</td><td>61 維：角速度3、重力方向3、關節位置14、關節速度14、上次 action 14、速度命令3、頭頸命令4、身體命令6</td><td>5 維：q, q̇, command, command_velocity, previous_action</td></tr>
+<tr><td>Action</td><td>14 維，<code>q_target = q_HOME + s·a</code>（s=1.0）</td><td>1 維，<code>target = a·20°</code></td></tr>
+<tr><td>控制頻率</td><td>50 Hz（物理 200 Hz，decimation 4）</td><td>同上</td></tr>
+<tr><td>網路</td><td>MLP 61→512→256→128→14，ELU</td><td>MLP 兩層 64，Tanh</td></tr>
+<tr><td>PPO</td><td>4096 環境×24 步，ε=0.2，γ=0.99，λ=0.95</td><td>單環境，n_steps=1024，ε=0.2，γ=0.99，λ=0.95</td></tr>
+</table></div>
+<p class="note">上表 microduck 數字來自原始碼分析；4096×24 = 98,304 筆 transition／iteration，每環境只前進 24×0.02 = 0.48 s。</p>
+
+<h3>0.4 為什麼要做單關節實驗</h3>
+<p>整隻 microduck 的問題（模擬物理、馬達、延遲、PPO）都能在 <code>head_yaw</code> 一個關節上縮小重現。學習路線：</p>
+<ol>
+<li><b>實驗2–4</b>：不用 RL，理解 MuJoCo 模擬迴圈與位置致動器。</li>
+<li><b>實驗5</b>：把控制問題包成 Gymnasium 環境（obs / action / reward / reset）。</li>
+<li><b>實驗6</b>：PPO 學習追蹤，與手寫控制器比較。</li>
+<li><b>實驗7–9</b>：固定策略，測頻率、阻尼、延遲敏感度，也就是 sim-to-real 的縮影。</li>
+</ol>
+<p>共同的時間結構：物理步 <code>0.005 s</code>（200 Hz），4 個物理步 = 1 次控制 <code>dt = 0.02 s</code>（50 Hz）；命令在 4 個物理步中保持不變（zero-order hold）。</p>
+<p class="goal"><b>方法論：</b>每次只改一個因素；記錄命令與結果，兩者不相等；區分「分數變高」與「走得更好」。</p>
+
+<h2 id="e2">單元 1｜實驗2 <code>experiment2_stand.py</code>：STAND 固定目標與自由機身</h2>
+<p class="goal"><b>目標：</b>能寫出基本 MuJoCo 模擬迴圈，並分清「載入模型」與「具備平衡能力」。</p>
+<h3>核心概念</h3>
+<ul>
+<li><b>兩個物件</b>：<code>MjModel</code>（結構與參數）、<code>MjData</code>（此刻狀態：<code>qpos</code>, <code>qvel</code>, <code>ctrl</code>, <code>time</code>）。</li>
+<li><b>索引不可假設相同</b>：actuator id、joint id、<code>jnt_qposadr</code>（qpos 位置）、<code>jnt_dofadr</code>（qvel 位置）要各自用 <code>mj_name2id</code> 解析。free joint 的機身佔 qpos 7 格、qvel 6 格，所以關節索引與 id 通常不同。</li>
+<li><b>STAND 是 keyframe，不是控制器</b>：<code>mj_resetDataKeyframe</code> 只設初始狀態與初始 ctrl。之後固定 ctrl 不會修正平衡，機器人可能倒下。</li>
+<li><b>qpos 與 ctrl 的差別</b>：改 qpos 是直接搬狀態；改 ctrl 是下命令讓物理演化，才會出現加速、摩擦與追蹤誤差。</li>
+</ul>
+<h3>程式結構</h3>
+<pre>model.opt.timestep = 0.005
+loop:  data.ctrl[:] = home_ctrl          # 每 20 ms 一次命令
+       for _ in range(4): mj_step(...)   # 4 個物理步
+       mj_forward(...)                   # 刷新 xpos/xmat 後才記錄姿態
+       寫 CSV（目標、實際、誤差、機身姿態、tilt、接觸數）</pre>
+<ul>
+<li><code>--fix-base</code>：用 <code>MjSpec.add_equality</code> 加一個 world–trunk_base 的 weld 約束，隔離頭部伺服響應；這不是平衡控制。</li>
+<li>機身傾角：<code>tilt = acos(R[2,2])</code>，超過 45° 程式警告：之後資料含失衡影響。</li>
+<li>穩定性防護：非有限值檢查；<code>data.time</code> 倒退表示 MuJoCo 因發散重設，直接停止。</li>
+<li>CSV 用 <code>"x"</code> 模式開檔，避免覆蓋既有實驗紀錄。</li>
+</ul>
+<p class="note">完成條件：能說出為何 <code>nq ≠ nu</code>，並解釋自由機身 RMSE 為何不能當伺服性能。</p>
+
+<h2 id="e3">單元 2｜實驗3 <code>experiment3_head_sine.py</code>：正弦目標與追蹤誤差</h2>
+<p class="goal"><b>目標：</b>親眼看到「命令 ≠ 瞬間實際狀態」，並學會平滑地施加激勵。</p>
+<p>程式與實驗2共用骨架，用 <code>EXPERIMENT</code> 常數切換是否加入正弦。命令：</p>
+<pre>envelope = 0.5 − 0.5·cos(π·min((t − settle)/ramp, 1))     # 餘弦漸增，0→1
+ctrl_head = home_head + A · envelope · sin(2π f (t − settle))</pre>
+<ul>
+<li>預設 A = 10°、f = 0.25 Hz、settle 2 s（先靜止）、ramp 2 s。</li>
+<li>餘弦包絡讓振幅起點與終點的斜率為零，避免一開始階躍衝擊造成暫態，汙染穩態量測。</li>
+<li>啟動前檢查 <code>home ± A</code> 是否超出關節範圍與 ctrl range。</li>
+<li>記錄量：目標 q<sub>cmd</sub>、實際 q、q̇、誤差 <code>q_cmd − q</code>、機身姿態。</li>
+</ul>
+<h3>建議的三個比較</h3>
+<ol><li>低頻小角度：基本追蹤。</li><li>提高頻率：誤差與相位落後上升。</li><li>換增益或負載：見實驗4。</li></ol>
+<p class="note">注意 CSV 的 <code>time_s</code> 是區間末，<code>command_time_s</code> 是命令產生時間，兩者差 20 ms；分析相位時要記得對齊。</p>
+
+<h2 id="e4">單元 3｜實驗4 <code>experiment4_actuator_kp.py</code>：只改 head_yaw 的 Kp</h2>
+<p class="goal"><b>目標：</b>理解 MuJoCo position 致動器內部公式，並知道為何 Kp 要同時寫入兩個欄位。</p>
+<h3>推導：position 致動器</h3>
+<p>MuJoCo 的力為 <code>F = gain·u + b0 + b1·length + b2·velocity</code>。位置伺服的編譯結果是 <code>gainprm[0] = kp</code>、<code>biasprm = [0, −kp, −kv]</code>，即：</p>
+<pre>τ = kp·u − kp·q − kv·q̇ = kp(u − q) − kv·q̇</pre>
+<p>單關節的線性近似（J 為等效慣量、c 為關節 damping）：</p>
+<pre>J·q̈ + (c + kv)·q̇ + kp·q = kp·u
+ωn = √(kp/J),   ζ = (c + kv) / (2√(kp·J))</pre>
+<p>所以 Kp 加倍：ωn 增為 √2 倍、ζ 降為 1/√2；頻寬變寬但更容易過衝。這也是為何只改 <code>gainprm</code> 而不改 <code>biasprm[1]</code> 是錯的：目標與實際角度的關係會變成 <code>τ = kp'·u − kp·q</code>，穩態會偏離目標（需要 q = kp'/kp·u），不是單純改 Kp。</p>
+<h3>程式重點（A–E 區段）</h3>
+<ul>
+<li><b>B 驗證</b> <code>validate_position</code>：只接受 gear=1、無 activation dynamics、fixed gain、affine bias、直接 hinge 傳動，且 <code>biasprm[1] == −kp</code>。避免把 general / motor 誤當位置控制器。</li>
+<li><b>C 修改</b>：<code>gainprm[head,0] = biasprm[head,1]·(−1) = kp×scale</code>，只改記憶體，不改 XML；Kv、damping、frictionloss、armature 皆保持原值。</li>
+<li><b>E 診斷</b>：每個物理步起點 <code>mj_forward</code> 後用 actuator length/velocity 重建 <code>raw</code> 力矩，與 <code>actuator_force</code>（限幅後）比較，得到區間內峰值力矩與「達到力矩界限」比例。</li>
+<li>穩態 RMSE 只計 <code>command_time ≥ settle+ramp</code>，排除暫態；不補償相位或 20 ms 時戳差。</li>
+<li>每次輸出 CSV 與同名 <code>.parameters.json</code>，保留完整配置以便重現。</li>
+</ul>
+<p class="note">預設固定機身、±10°、0.5 Hz、30 s。用法：<code>--inspect-only</code> 先看有效參數，再跑 <code>--kp-scale 0.5 / 1 / 2</code>。取樣是離散的，峰值不等於連續時間最大值。</p>
+
+<h2 id="e5">單元 4｜實驗5 <code>experiment5_head_env.py</code>：MuJoCo → Gymnasium 環境</h2>
+<p class="goal"><b>目標：</b>把控制問題寫成 RL 任務，說清楚 obs、action、reward、terminated / truncated 的每個決定。</p>
+<h3>環境規格</h3>
+<div class="tw"><table>
+<tr><th>項目</th><th>內容</th></tr>
+<tr><td>模型</td><td>內嵌 XML：固定底座＋單一 head_yaw（range ±0.6 rad, damping .002, armature .001）；<code>position kp=.25 kv=.02</code>，ctrlrange ±20°，forcerange ±0.08 N·m</td></tr>
+<tr><td>Action</td><td><code>a ∈ [−1,1]</code>（shape (1,)），<code>target = a·20°</code></td></tr>
+<tr><td>Observation</td><td><code>[q, q̇, command, command_velocity, previous_action]</code>；前四項單位 rad, rad/s, rad, rad/s</td></tr>
+<tr><td>命令</td><td><code>c = A sin(2πft + φ₀)</code>，A=10°，φ₀ 於 reset 隨機；<code>c, ċ</code> 一起提供相位資訊</td></tr>
+<tr><td>Reward</td><td><code>exp(−(e/5°)²) − 0.02·(a − a_prev)²</code>，e = q − c（步末）；沒有乘 dt</td></tr>
+<tr><td>終止</td><td>terminated：|q| &gt; 30°（教學門檻）；truncated：steps ≥ max_steps（duration/dt）</td></tr>
+</table></div>
+<h3>設計要點</h3>
+<ul>
+<li><b>為何 obs 要有 command_velocity 與 previous_action？</b>只給位置命令 c，策略分不出命令正在往哪邊走（相位）；previous_action 讓策略能感知平滑懲罰與致動器狀態。</li>
+<li><b>Reward 形狀</b>：Gaussian，誤差 = 5° 時得 e<sup>−1</sup> ≈ 0.37；誤差 0 得 1。平滑懲罰抑制 action 跳變，與 microduck 的 action rate 成本同一概念。</li>
+<li><b>reset() 回傳 (obs, info)，step() 回傳 5 元組</b>；環境不自動 reset，episode 結束後必須由呼叫端 reset。</li>
+<li><b>三種基準控制器</b>（<code>baseline_action</code>，不是學出來的）：<code>zero</code>（目標 0）、<code>direct</code>（target = command）、<code>feedback</code>（target = c + 0.35(c−q) + 0.025(ċ−q̇)）。</li>
+<li>相同 seed 提供相同初始角度與相位，跨控制器公平比較。</li>
+<li><code>check_env</code> 驗證 Gymnasium 介面；observation_space 設無限界只是讓瞬態通過，不是正規化。</li>
+</ul>
+<p class="note">閱讀順序：XML → __init__ → reset → step → baseline_action → main。這個檔案是實驗6–9的共同基底，其 SHA256 會被記錄以確保比較的是同一環境。</p>
+
+<h2 id="e6">單元 5｜實驗6 <code>experiment6_ppo.py</code>：用 PPO 學追蹤</h2>
+<p class="goal"><b>目標：</b>說明 PPO 一次訓練發生什麼，並公平評估學到的策略。</p>
+<h3>PPO 概念</h3>
+<pre>δ_t = r_t + γ·V(s_{t+1}) − V(s_t)            # TD 誤差
+Â_t = Σ_l (γλ)^l · δ_{t+l}                    # GAE，γ=.99, λ=.95
+ρ_t = π_θ(a|o) / π_θold(a|o)
+L_clip = E[ min(ρ_t·Â_t, clip(ρ_t, 1−ε, 1+ε)·Â_t) ]   # ε = 0.2</pre>
+<p>Critic 估計未來累積回報以計算 advantage；clipping 限制單次更新的策略改變量。</p>
+<h3>程式結構</h3>
+<ul>
+<li><b>[A]</b> 建立未訓練的 actor/critic：<code>MlpPolicy</code>，<code>net_arch = pi[64,64], vf[64,64]</code>，Tanh；<code>n_steps=1024, batch_size=64, n_epochs=10, lr=3e-4, ent_coef=0</code>；單環境、CPU、無 observation/reward 正規化。</li>
+<li><b>[B]</b> <code>model.learn()</code>：蒐集 1024 步 rollout → GAE → 10 epochs、mini-batch 64 更新，重複。總步數向上取整到 1024 的倍數。</li>
+<li>訓練時 Gaussian 抽樣探索；評估時 <code>deterministic=True</code>（取均值，再由 SB3 截限）。</li>
+<li>存 <code>initial.zip</code>（未訓練）與 <code>final.zip</code>（SB3 ZIP，非 ONNX），checkpoint 每 10000 步。</li>
+<li>可重現性：<code>config.json</code> 記錄 seed、套件版本與 <code>experiment5_head_env.py</code> 的 SHA256；評估時不符就拒絕執行。</li>
+</ul>
+<h3>評估設計</h3>
+<p>五種控制器 <code>zero / direct / feedback / initial / final</code>，用<b>完全相同</b>的評估 seed（10000 起，與訓練 seed 42 分開）。指標：RMSE、2 秒後 RMSE（排除暫態）、mean reward、failed_episodes。<b>initial 對 final</b> 的比較才能證明改善來自學習，不是網路結構或環境本身。</p>
+<h3>實測結果（10 回合，seed 10000 起，0.5 Hz）</h3>
+<div class="tw"><table>
+<tr><th>控制器</th><th>RMSE (°)</th><th>2 s 後 RMSE (°)</th><th>mean reward</th><th>失敗</th></tr>
+<tr><td>zero</td><td>7.072</td><td>7.071</td><td>0.308</td><td>0</td></tr>
+<tr><td>direct</td><td>2.179</td><td>2.175</td><td>0.835</td><td>0</td></tr>
+<tr><td>feedback</td><td>1.600</td><td>1.594</td><td>0.905</td><td>0</td></tr>
+<tr><td>initial（未訓練）</td><td>7.051</td><td>7.051</td><td>0.309</td><td>0</td></tr>
+<tr><td>final（PPO）</td><td>0.071</td><td>0.047</td><td>0.9997</td><td>0</td></tr>
+</table></div>
+<h3>判讀</h3>
+<ul>
+<li><b>zero = A/√2</b>：目標恆為 0 時誤差就是命令本身，10°/√2 = 7.07°，與實測吻合，是驗證環境與指標的理想錨點。</li>
+<li><b>initial ≈ zero</b>（7.05 vs 7.07）：未訓練網路輸出接近 0，證明 final 的改善來自學習，不是網路結構。</li>
+<li><b>final 在暫態後誤差僅 0.047°</b>，約為手寫 feedback（1.594°）的 1/34。但 feedback 的 0.35／0.025 係數只是示例、未經調校，此比值不代表 PPO 對最佳化 PD 的優勢。更公平的說法：PPO 自動找到遠高於範例的有效增益，且 mean reward 已達 0.9997（上限約 1）。</li>
+<li>全程 RMSE 0.071° 與 2 s 後 0.047° 的差來自開頭的初始偏移（±2°）暫態。</li>
+<li>單一訓練 seed、單一頻率，不能推論為一般性能。</li>
+</ul>
+<p class="note">此為教學用 SB3 PPO，不是 microduck 官方 mjlab／rsl_rl 訓練入口。指令：<code>train --steps 100000 --out runs/head_ppo_01</code>；<code>evaluate --run … --episodes 10</code>。</p>
+
+<h2 id="e7">單元 6｜實驗7 <code>experiment7_frequency_test.py</code>：頻率泛化</h2>
+<p class="goal"><b>目標：</b>測試策略在訓練分布之外的行為，並理解 distribution shift 的內涵。</p>
+<ul>
+<li>固定 <code>final.zip</code>，命令頻率 0.25 / 0.5 / 0.75 / 1 Hz（訓練只用 0.5 Hz），每組 10 回合×10 s，前 2 s 視為暫態；不呼叫 learn。</li>
+<li>每個頻率下 direct / feedback / ppo 的命令完全相同（同 seed）。</li>
+<li><b>頻率改變的不只是「動作加快」</b>：<code>command_velocity = A·2πf·cos(·)</code> 的幅度隨 f 線性放大（0.25→1 Hz 差 4 倍），obs 的第四維分布也跟著變。策略可能沒看過這種輸入範圍。</li>
+<li>輸出 <code>summary.csv</code>、<code>episodes.csv</code>、逐步 CSV、<code>metadata.json</code>；結束時再驗證模型檔 SHA256 未被改動。</li>
+<li><code>action_at_limit_fraction</code> 是施加 action 觸及 ±1 邊界的比例，不是力矩飽和比例。</li>
+</ul>
+<h3>實測結果（2 s 暫態後 RMSE，單位 °；失敗回合皆為 0）</h3>
+<div class="tw"><table>
+<tr><th>頻率</th><th>direct</th><th>feedback</th><th>PPO</th><th>PPO action 觸限比例</th></tr>
+<tr><td>0.25 Hz</td><td>1.068</td><td>0.788</td><td>0.022</td><td>0.50%</td></tr>
+<tr><td>0.5 Hz（訓練）</td><td>2.175</td><td>1.594</td><td>0.047</td><td>0.58%</td></tr>
+<tr><td>0.75 Hz</td><td>3.353</td><td>2.432</td><td>0.095</td><td>0.62%</td></tr>
+<tr><td>1.0 Hz</td><td>4.610</td><td>3.308</td><td>0.169</td><td>0.68%</td></tr>
+</table></div>
+<h3>判讀</h3>
+<ul>
+<li>兩個手寫控制器的誤差幾乎與頻率成正比（direct 1.07→4.61，約 4.3 倍）：純相位落後的特徵，誤差幅度 ≈ 命令斜率 × 等效延遲。</li>
+<li>PPO 在訓練頻率外仍平順退化：0.022→0.169°（約 7.7 倍），且在 1 Hz 時仍比 feedback 低約 20 倍。沒有崩潰，表示策略學到的是依 q, q̇, c, ċ 的局部映射，而不是死記 0.5 Hz 的波形。</li>
+<li>這仍在「同型態命令、僅頻率不同」的範圍內；1 Hz 與訓練頻率只差 2 倍，不代表能外插到更高頻或不同波形。</li>
+<li>action 觸限比例僅 0.5–0.7%，PPO 沒有靠 bang-bang 換取精度。</li>
+</ul>
+<p class="note">結論範圍：這是單次訓練所得策略的敏感度測試，不是多個訓練 seed 的統計結論。RMSE 必須與 failed_episodes 一起判讀。</p>
+
+<h2 id="e8">單元 7｜實驗8 <code>experiment8_damping_test.py</code>：被動黏滯阻尼敏感度</h2>
+<p class="goal"><b>目標：</b>理解模型參數誤差如何進入閉迴路，並避免混淆兩種「阻尼」。</p>
+<ul>
+<li>命令固定 0.5 Hz、±10°；阻尼倍率 0.5 / 1 / 2；只改 <code>model.dof_damping[env.vid]</code>。</li>
+<li><b>兩個不同來源</b>：關節被動阻尼 c = 0.002（XML joint damping）；致動器 kv = 0.02（讀自 <code>−biasprm[2]</code>）。實際等效阻尼是 <code>c + kv</code>，寫入 <code>parameters.csv</code> 的 <code>damping_plus_kv</code> 欄。</li>
+<li>用實驗4的二階近似：ζ = (c + kv)/(2√(kp·J))。以教學模型估算（J ≈ 1.2×10⁻³ kg·m²，粗估）：ωn ≈ 14 rad/s（約 2.3 Hz），ζ ≈ 0.6。c 由 0.5× 到 2× 只讓 c+kv 從 0.021 變到 0.024（約 14% 範圍），因為 kv 遠大於 c，預期敏感度不大。</li>
+<li>每次建構環境都從原始值乘倍率，避免跨回合累乘；每回合 reset 後檢查阻尼未被還原，並 <code>mj_forward</code>。</li>
+<li>觀測不含阻尼值，策略只能靠原本 5 個觀測產生動作，因此這是固定參數測試，不是 domain randomization 訓練。</li>
+</ul>
+<h3>實測結果（2 s 暫態後 RMSE，單位 °；失敗回合皆為 0）</h3>
+<div class="tw"><table>
+<tr><th>阻尼倍率（c）</th><th>direct</th><th>feedback</th><th>PPO</th></tr>
+<tr><td>0.5×（0.001）</td><td>2.094</td><td>1.532</td><td>0.0455</td></tr>
+<tr><td>1×（0.002）</td><td>2.175</td><td>1.594</td><td>0.0465</td></tr>
+<tr><td>2×（0.004）</td><td>2.336</td><td>1.716</td><td>0.0524</td></tr>
+</table></div>
+<h3>判讀</h3>
+<ul>
+<li>如預期，敏感度小：阻尼放大 4 倍（0.5×→2×），direct 與 feedback 的誤差僅增約 12%，與 c+kv 只變約 14% 相符。方向也對：阻尼越大，響應越慢、相位落後越大、誤差越大。</li>
+<li>PPO 的相對變化（+15%）看似最大，但絕對值只從 0.046° 到 0.052°，遠小於手寫控制器的誤差。</li>
+<li>這個結果不代表「PPO 對阻尼穩健」的一般結論：致動器 kv 主導了阻尼，測試範圍內模型幾乎沒被改變。若要檢驗參數穩健性，應改變 kp、kv 或慣量（例如頭部質量）。</li>
+</ul>
+<p class="note">對照 microduck：訓練時的 domain randomization 就是把摩擦、轉子慣性、電壓、負載壓降等參數在一個分布內隨機化，讓策略在訓練時就面對不確定性。</p>
+
+<h2 id="e9">單元 8｜實驗9 <code>experiment9_action_delay.py</code>：action 純延遲</h2>
+<p class="goal"><b>目標：</b>量化延遲對閉迴路的影響，並看懂如何在不改原環境下擴充它（子類別加 FIFO）。</p>
+<h3>延遲模型</h3>
+<p>延遲 d 步：第 k 區間施加 <code>u[k−d]</code>，負索引為 0。<code>DelayedHeadEnv</code> 用 <code>deque</code>：</p>
+<pre>reset:  pending = [0.0]*d
+step:   pending.append(sent);  applied = pending.popleft()   # d=0 時立即取出
+        obs, ... = super().step(applied)
+        obs[-1] = sent            # 策略仍看到「上一個送出」的 action</pre>
+<ul>
+<li>默認 d = 0, 1, 2, 4 步，對應 0 / 20 / 40 / 80 ms。這是<b>命令傳送延遲</b>，不是感測延遲，也不改致動器內部 PD 更新頻率。</li>
+<li>策略看不到延遲值與佇列內容（部分可觀測），這是最貼近實機的情形。</li>
+<li>平滑懲罰針對相鄰「送出」action；另記 <code>applied_smoothness_penalty</code>。CSV 的 <code>action / target_deg</code> 是「已施加」語意，<code>sent_action / sent_target_deg</code> 是新送出值；d=0 時兩者相同。</li>
+<li>每次 reset 佇列與歷史清零，避免跨回合殘留。</li>
+</ul>
+<h3>預期量級與驗證</h3>
+<p>純延遲 τ 在頻率 f 造成相位落後 <code>φ = 360°·f·τ</code>：0.5 Hz 時 d=1 為 3.6°，d=4 為 14.4°。對振幅 A 的正弦，相位差 φ 造成的誤差幅度為 <code>2A·sin(φ/2)</code>，RMS 再除以 √2。</p>
+<p><b>用 direct 檢驗這個模型：</b>d=0 時 RMSE 2.175° 對應誤差幅度 3.08°，反推伺服本身的落後 φ₀ ≈ 17.7°；加上 d=4 的 14.4° 得 φ ≈ 32.1°，預測 RMSE = 2·10·sin(16.1°)/√2 ≈ 3.92°，實測 3.919°。純延遲加上伺服落後的相位相加，這個一階模型解釋了 direct 的行為。</p>
+<h3>實測結果（2 s 暫態後 RMSE，單位 °）</h3>
+<div class="tw"><table>
+<tr><th>延遲</th><th>direct</th><th>feedback</th><th>PPO</th><th>PPO 觸限比例</th></tr>
+<tr><td>0（0 ms）</td><td>2.175</td><td>1.594</td><td>0.047</td><td>0.6%</td></tr>
+<tr><td>1（20 ms）</td><td>2.616</td><td>1.920</td><td>2.509</td><td>60%</td></tr>
+<tr><td>2（40 ms）</td><td>3.053</td><td>2.246</td><td>6.601</td><td>81%</td></tr>
+<tr><td>4（80 ms）</td><td>3.919</td><td>2.904</td><td>12.092</td><td>88%</td></tr>
+</table></div>
+<h3>判讀：全課最重要的一組結果</h3>
+<ul>
+<li><b>手寫控制器平順退化</b>，每步延遲約使誤差加 0.4–0.5°，符合相位模型。</li>
+<li><b>PPO 在 20 ms 就從 0.047° 惡化到 2.5°（約 54 倍），action 觸限比例從 0.6% 跳到 60%。</b>觸限比例是關鍵訊號：策略被推進飽和，行為接近 bang-bang。</li>
+<li>d=2 的 PPO（6.60°）已接近「什麼都不做」的 zero 基準（7.07°）；d=4 為 12.09°，<b>比 zero 更差</b>，最大誤差達 23.1°（其餘控制器約 10.4°）。所有回合仍未被判失敗，只因 30° 終止門檻未被跨過，可見「未失敗」不是好指標。</li>
+<li><b>合理解釋（假設，未用逐步 CSV 驗證）</b>：零延遲下訓練出的策略等效增益很高，才能達到 0.05°；延遲吃掉相位裕度後，高增益迴路變成持續振盪，直到 action 被截限，形成極限環。可用逐步 CSV 檢查 action 是否以固定週期正負交替來驗證。</li>
+<li>這是 sim-to-real 的典型失效：策略對「訓練時不存在的通訊延遲」極度敏感。對策是在訓練時隨機化延遲（microduck 的做法）、把最近數步 action 歷史放入觀測，或加大平滑懲罰以壓低增益。</li>
+<li>再次提醒：單一訓練 seed，且延遲對 PPO 是「未見過」的擾動；並不代表所有 RL 策略都如此脆弱。</li>
+</ul>
+<p class="note">這是測試單一已訓練模型，不是延遲補償訓練。microduck 訓練則把 IMU 派生觀測延遲 0–1 個控制週期、關節速度固定落後 1 週期，直接放入訓練隨機化。</p>
+
+<h2 id="sum">總結：從單關節到 microduck 的對照</h2>
+<div class="tw"><table>
+<tr><th>實驗</th><th>學到的機制</th><th>對應 microduck 議題</th></tr>
+<tr><td>2 STAND</td><td>MuJoCo 迴圈、keyframe、索引</td><td>載入 scene_walk.xml，站姿不等於平衡</td></tr>
+<tr><td>3 正弦</td><td>命令 vs 實際、平滑激勵</td><td>action 與關節響應的落差</td></tr>
+<tr><td>4 Kp</td><td>position 致動器公式、ωn/ζ</td><td>BAM 馬達模型、kp_fw</td></tr>
+<tr><td>5 Env</td><td>obs/action/reward/終止</td><td>61 維 obs、14 維 action、reward 項權重</td></tr>
+<tr><td>6 PPO</td><td>2 s 後 RMSE 7.05°→0.047°（initial→final）</td><td>4096 環境 PPO 訓練</td></tr>
+<tr><td>7 頻率</td><td>PPO 0.25→1 Hz 平順退化（0.02→0.17°）</td><td>速度命令範圍與 curriculum</td></tr>
+<tr><td>8 阻尼</td><td>阻尼 4 倍僅約 +12% 誤差（kv 主導）</td><td>domain randomization（摩擦、質量、電壓）</td></tr>
+<tr><td>9 延遲</td><td>相位模型；PPO 在 20 ms 即高增益振盪（觸限 60%）</td><td>觀測延遲、runtime 的 20 ms 時序預算</td></tr>
+</table></div>
+<h3>部署端要點（導論延伸）</h3>
+<ul>
+<li>ONNX 需連 observation normalizer 一起匯出；漏掉時 play 正常、實機失效。</li>
+<li>50 Hz 是排程目標，非硬即時：需量測 <code>T_read + T_obs + T_infer + T_write + T_schedule &lt; 20 ms</code>。</li>
+<li>訓練與 runtime 的 action scale / 低通濾波若不同，同一個 ONNX 等於在控制不同的系統。</li>
+<li>shape 正確（61→14）不等於語意正確：關節順序、單位、HOME、IMU 座標、last_action 都要核對。</li>
+</ul>
+<p class="note">實驗1（開啟 scene_walk.xml 的 viewer）未附程式，僅在導論路線中；版本依據 microduck_rl develop 53b8971、microduck main 6507d2e。</p>
+</div></body></html>
