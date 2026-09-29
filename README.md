@@ -2,7 +2,7 @@
 
 以 [microduck](https://github.com/pollen-robotics/microduck_rl) 開源專案為藍本的教學實驗。前半用 MuJoCo 理解機器人物理模擬與位置致動器，後半把單一關節 `head_yaw` 寫成 Gymnasium 環境，用 PPO 訓練追蹤策略，並測試策略對頻率、阻尼、延遲的敏感度。
 
-**English summary:** A step-by-step lab series that scales microduck's sim-to-real pipeline (MuJoCo physics → RL environment → PPO → robustness tests) down to a single joint, so every mechanism can be inspected in a few hundred lines of code. Main finding: a PPO policy that tracks a sine command to 0.05° at zero delay degrades sharply with only 20 ms of action delay (RMSE 0.05° → 2.5°), while hand-written controllers degrade gracefully.
+
 
 > 這是教學用簡化模型，不是 microduck 官方模型、BAM 馬達模型或官方 mjlab／rsl_rl 訓練流程。
 
